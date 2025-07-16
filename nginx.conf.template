@@ -26,7 +26,7 @@ server {
         root /var/www/certbot;
     }
 
-    # Main application routes
+    # Main application routes - always serve content over HTTP for local development
     location / {
         proxy_pass http://ssr;
         proxy_set_header Host $host;
@@ -54,12 +54,13 @@ server {
     }
 }
 
+# HTTPS server configuration (only active when SSL certificates are present)
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2; # for ipv6
     server_name plant.genenames.org pgnc.genenames.org;
 
-    # SSL
+    # SSL certificates
     ssl_certificate /etc/letsencrypt/live/plant.genenames.org/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/plant.genenames.org/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -67,8 +68,8 @@ server {
 
     charset UTF-8;
 
-    error_log /var/log/nginx/pgnc.error.log;
-    access_log /var/log/nginx/pgnc.access.log;
+    error_log /var/log/nginx/pgnc-ssl.error.log;
+    access_log /var/log/nginx/pgnc-ssl.access.log;
 
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
