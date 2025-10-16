@@ -1,0 +1,474 @@
+name: Nginx Release
+
+on:
+  push:
+    branches:
+      - release
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Optional semantic bump override"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+        required: false
+      explicit_version:
+        description: "Optional explicit semantic version (vX.Y.Z)"
+        type: string
+        required: false
+      confirm_major:
+        description: "Acknowledge major release when release_type=major"
+        type: boolean
+        default: false
+        required: false
+      notes_override:
+        description: "Optional manual release notes markdown"
+        type: string
+        required: false
+
+concurrency:
+  group: nginx-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_REPOSITORY: ghcr.io/hgnc/pgnc-nginx
+
+jobs:
+  validate_inputs:
+    name: Validate Inputs & Preflight
+    runs-on: ubuntu-latest
+    outputs:
+      release_type: ${{ steps.evaluate.outputs.release_type }}
+      explicit_version: ${{ steps.evaluate.outputs.explicit_version }}
+      notes_override: ${{ steps.evaluate.outputs.notes_override }}
+      trigger_type: ${{ steps.evaluate.outputs.trigger_type }}
+      notes_override_state: ${{ steps.evaluate.outputs.notes_override_state }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Ensure required action exists (optional)
+        run: |
+          set -euo pipefail
+          if [ -d ".github/actions/calculate-version" ] && [ ! -f ".github/actions/calculate-version/action.yml" ]; then
+            echo "calculate-version action appears incomplete" >&2
+            exit 1
+          fi || true
+
+      - name: Validate trigger context
+        id: evaluate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_RELEASE_TYPE: ${{ github.event.inputs.release_type }}
+          INPUT_EXPLICIT_VERSION: ${{ github.event.inputs.explicit_version }}
+          INPUT_CONFIRM_MAJOR: ${{ github.event.inputs.confirm_major }}
+          INPUT_NOTES_OVERRIDE: ${{ github.event.inputs.notes_override }}
+        run: |
+          set -euo pipefail
+
+          event="${EVENT_NAME}"
+          ref="${REF}"
+
+          if [ "${event}" = "push" ] && [ "${ref}" != "refs/heads/release" ]; then
+            echo "This workflow only supports pushes to the release branch." >&2
+            exit 1
+          fi
+
+          release_type="${INPUT_RELEASE_TYPE:-}"
+          explicit_version="${INPUT_EXPLICIT_VERSION:-}"
+          confirm_major="${INPUT_CONFIRM_MAJOR:-false}"
+          notes_override="${INPUT_NOTES_OVERRIDE:-}"
+
+          if [ -z "${release_type}" ]; then
+            release_type="patch"
+          fi
+
+          release_type_lower=$(printf '%s' "${release_type}" | tr '[:upper:]' '[:lower:]')
+          case "${release_type_lower}" in
+            major|minor|patch)
+              ;;
+            *)
+              echo "Unsupported release_type: ${release_type}" >&2
+              exit 1
+              ;;
+          esac
+
+          if [ "${release_type_lower}" = "major" ] && [ "${confirm_major}" != "true" ]; then
+            echo "Major releases require confirm_major=true." >&2
+            exit 1
+          fi
+
+          if [ -n "${explicit_version}" ]; then
+            if ! printf '%s' "${explicit_version}" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "explicit_version must match vX.Y.Z" >&2
+              exit 1
+            fi
+            explicit_version="v$(printf '%s' "${explicit_version}" | sed 's/^v//')"
+          fi
+
+          trigger_type="${event}"
+
+          {
+            printf 'release_type=%s\n' "${release_type_lower}"
+            printf 'explicit_version=%s\n' "${explicit_version}"
+            printf 'notes_override<<__NOTE__\n%s\n__NOTE__\n' "${notes_override}"
+            printf 'trigger_type=%s\n' "${trigger_type}"
+              if [ -n "${notes_override}" ]; then
+                printf 'notes_override_state=true\n'
+              else
+                printf 'notes_override_state=false\n'
+              fi
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Pre-flight permission checks
+        env:
+          GH_TOKEN_FROM_SECRET: ${{ secrets.GH_PAT || github.token }}
+          GH_TOKEN_FROM_CONTEXT: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          token="${GH_TOKEN_FROM_SECRET:-${GH_TOKEN_FROM_CONTEXT:-}}"
+          if [ -z "${token}" ]; then
+            echo "::error::No GitHub token detected from secrets.GH_PAT or github.token." >&2
+            exit 1
+          fi
+          export GITHUB_TOKEN="${token}"
+
+  calculate_version:
+    name: Calculate Version
+    runs-on: ubuntu-latest
+    needs: validate_inputs
+    outputs:
+      next_version: ${{ steps.version.outputs.next_version }}
+      is_bootstrap: ${{ steps.version.outputs.is_bootstrap }}
+      previous_version: ${{ steps.version.outputs.previous_version }}
+      release_strategy: ${{ steps.version.outputs.release_strategy }}
+      resolved_release_type: ${{ steps.version.outputs.resolved_release_type }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Calculate next version
+        id: version
+        uses: ./.github/actions/calculate-version
+        continue-on-error: true
+        with:
+          release_type: ${{ needs.validate_inputs.outputs.release_type }}
+          explicit_version: ${{ needs.validate_inputs.outputs.explicit_version }}
+          github_token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Ensure calculate-version succeeded
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.version.outcome }}" != "success" ]; then
+            echo "::error::calculate-version action failed. Check token scopes or GH_PAT secret." 
+            exit 1
+          fi
+
+  create_release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - calculate_version
+      - validate_inputs
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+    outputs:
+      release_url: ${{ steps.publish.outputs.release_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fail if calculated version is empty
+        env:
+          VERSION: ${{ needs.calculate_version.outputs.next_version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VERSION:-}" ]; then
+            echo "::error::Calculated next_version is empty." >&2
+            exit 1
+          fi
+
+      - name: Generate release notes
+        id: notes
+        uses: actions/github-script@v7
+        env:
+          TAG_NAME: ${{ needs.calculate_version.outputs.next_version }}
+          PREVIOUS_TAG: ${{ needs.calculate_version.outputs.previous_version }}
+        with:
+          github-token: ${{ secrets.GH_PAT || github.token }}
+          result-encoding: string
+          script: |
+            const tag = process.env.TAG_NAME;
+            const previous = process.env.PREVIOUS_TAG || undefined;
+
+            if (!previous) {
+              core.setOutput('source', 'bootstrap');
+              return `Initial automated release for ${tag}.`;
+            }
+
+            const response = await github.rest.repos.generateReleaseNotes({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              previous_tag_name: previous
+            });
+            core.setOutput('source', 'auto');
+            return response.data.body || `Automated release notes for ${tag}`;
+
+      - name: Publish release
+        id: publish
+        env:
+          VERSION: ${{ needs.calculate_version.outputs.next_version }}
+          NOTES: ${{ steps.notes.outputs.result }}
+          NOTES_OVERRIDE: ${{ needs.validate_inputs.outputs.notes_override }}
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+        run: |
+          set -euo pipefail
+
+          notes_body="${NOTES}"
+          if [ -n "${NOTES_OVERRIDE}" ]; then
+            notes_body="${NOTES_OVERRIDE}"
+          fi
+
+          notes_file=$(mktemp)
+          printf '%s\n' "${notes_body}" >"${notes_file}"
+
+          gh release create "${VERSION}" --target "${GITHUB_SHA}" --notes-file "${notes_file}" --latest
+
+          release_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${VERSION}"
+          printf 'release_url=%s\n' "${release_url}" >>"${GITHUB_OUTPUT}"
+          rm -f "${notes_file}"
+
+  build_and_push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs:
+      - validate_inputs
+      - calculate_version
+      - create_release
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      build_duration_seconds: ${{ steps.duration.outputs.seconds }}
+      image_size_bytes: ${{ steps.image_info.outputs.size_bytes }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Enable Docker BuildKit
+        run: echo "DOCKER_BUILDKIT=1" >>"${GITHUB_ENV}"
+
+      - name: Set build start timestamp
+        run: echo "BUILD_STARTED_AT=$(date +%s)" >>"${GITHUB_ENV}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        id: ghcr-login
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Ensure GHCR login succeeded
+        if: steps.ghcr-login.outcome != 'success'
+        run: |
+          echo "::error::Failed to authenticate with GHCR." >&2
+          exit 1
+
+      - name: Prepare build metadata
+        id: build_meta
+        run: |
+          printf 'created=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >>"${GITHUB_OUTPUT}"
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.IMAGE_REPOSITORY }}:${{ needs.calculate_version.outputs.next_version }}
+            ${{ env.IMAGE_REPOSITORY }}:latest
+            ${{ env.IMAGE_REPOSITORY }}:release
+          cache-from: type=gha,scope=nginx
+          cache-to: type=gha,scope=nginx,mode=max
+          build-args: |
+            BUILD_VERSION=${{ needs.calculate_version.outputs.next_version }}
+            BUILD_COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ steps.build_meta.outputs.created }}
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.calculate_version.outputs.next_version }}
+            org.opencontainers.image.created=${{ steps.build_meta.outputs.created }}
+
+      - name: Record image metadata
+        id: image_info
+        env:
+          IMAGE_REF: ${{ env.IMAGE_REPOSITORY }}:${{ needs.calculate_version.outputs.next_version }}
+        run: |
+          set -euo pipefail
+          info=$(docker buildx imagetools inspect "${IMAGE_REF}" --format '{{json .}}')
+          size=$(printf '%s' "${info}" | jq -r '
+            if (.manifest | type) == "object" and (.manifest.manifests // empty) then
+              reduce (.manifest.manifests[]?.size // 0) as $s (0; . + $s)
+            else
+              (.manifest.size // 0)
+            end')
+          if [ -z "${size}" ] || [ "${size}" = "null" ]; then
+            size=0
+          fi
+          printf 'size_bytes=%s\n' "${size}" >>"${GITHUB_OUTPUT}"
+
+      - name: Capture build duration
+        id: duration
+        run: |
+          end_ts=$(date +%s)
+          duration=$((end_ts - BUILD_STARTED_AT))
+          printf 'seconds=%s\n' "${duration}" >>"${GITHUB_OUTPUT}"
+
+      - name: Summarize release
+        env:
+          VERSION: ${{ needs.calculate_version.outputs.next_version }}
+          STRATEGY: ${{ needs.calculate_version.outputs.release_strategy }}
+          BOOTSTRAP: ${{ needs.calculate_version.outputs.is_bootstrap }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          RELEASE_URL: ${{ needs.create_release.outputs.release_url }}
+          DURATION: ${{ steps.duration.outputs.seconds }}
+          CREATED: ${{ steps.build_meta.outputs.created }}
+          RELEASE_TYPE: ${{ needs.validate_inputs.outputs.release_type }}
+          TRIGGER: ${{ needs.validate_inputs.outputs.trigger_type }}
+          EXPLICIT_VERSION: ${{ needs.validate_inputs.outputs.explicit_version }}
+          NOTES_OVERRIDE_STATE: ${{ needs.validate_inputs.outputs.notes_override_state }}
+          IMAGE_SIZE: ${{ steps.image_info.outputs.size_bytes }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          explicit="${EXPLICIT_VERSION:-auto}"
+          if [ -z "${explicit}" ]; then
+            explicit="auto"
+          fi
+          if [ "${NOTES_OVERRIDE_STATE}" = "true" ]; then
+            notes_status="manual override"
+          else
+            notes_status="auto"
+          fi
+          image_size_display="${IMAGE_SIZE:-0}"
+          human_size="${image_size_display}"
+          if command -v numfmt >/dev/null 2>&1 && printf '%s' "${image_size_display}" | grep -Eq '^[0-9]+$' && [ "${image_size_display}" -ne 0 ]; then
+            human_size=$(numfmt --to=iec "${image_size_display}")
+          fi
+          cat <<EOF >>"${GITHUB_STEP_SUMMARY}"
+          ## Nginx Release Summary
+
+          - Version: ${VERSION}
+          - Release strategy: ${STRATEGY}
+          - Bootstrap run: ${BOOTSTRAP}
+          - Release type: ${RELEASE_TYPE}
+          - Trigger: ${TRIGGER}
+          - Explicit version: ${explicit}
+          - Release notes: ${notes_status}
+          - Image digest: ${DIGEST}
+          - Image size: ${image_size_display} bytes (${human_size})
+          - Release URL: ${RELEASE_URL}
+          - Build duration (s): ${DURATION}
+          - Image created: ${CREATED}
+          - Workflow run: ${RUN_URL} (attempt ${RUN_ATTEMPT})
+
+          Tags pushed:
+          - ${IMAGE_REPOSITORY}:${VERSION}
+          - ${IMAGE_REPOSITORY}:latest
+          - ${IMAGE_REPOSITORY}:release
+          EOF
+
+  finalize:
+    name: Finalize Pipeline
+    runs-on: ubuntu-latest
+    needs:
+      - validate_inputs
+      - calculate_version
+      - create_release
+      - build_and_push
+    if: always()
+    outputs:
+      release_version: ${{ steps.set_outputs.outputs.release_version }}
+      release_url: ${{ steps.set_outputs.outputs.release_url }}
+      image_digest: ${{ steps.set_outputs.outputs.image_digest }}
+      image_size_bytes: ${{ steps.set_outputs.outputs.image_size_bytes }}
+      build_duration_seconds: ${{ steps.set_outputs.outputs.build_duration_seconds }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify release and image alignment
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+          VERSION: ${{ needs.calculate_version.outputs.next_version }}
+          IMAGE_TAG: ${{ env.IMAGE_REPOSITORY }}:${{ needs.calculate_version.outputs.next_version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          release_tag=$(gh release view "${VERSION}" --repo "${REPOSITORY}" --json tagName --jq '.tagName')
+          if [ -z "${release_tag}" ]; then
+            echo "::error::Unable to retrieve release tag for ${VERSION}." >&2
+            exit 1
+          fi
+          if [ "${release_tag}" != "${VERSION}" ]; then
+            echo "::error::Release tag ${release_tag} does not match expected ${VERSION}." >&2
+            exit 1
+          fi
+
+      - name: Display workflow outputs
+        run: |
+          echo "::group::Release Outputs"
+          echo "Version: ${{ needs.calculate_version.outputs.next_version }}"
+          echo "Release URL: ${{ needs.create_release.outputs.release_url }}"
+          echo "Image digest: ${{ needs.build_and_push.outputs.image_digest }}"
+          echo "Image size (bytes): ${{ needs.build_and_push.outputs.image_size_bytes }}"
+          echo "Build duration (s): ${{ needs.build_and_push.outputs.build_duration_seconds }}"
+          echo "::endgroup::"
+
+      - name: Set pipeline outputs
+        id: set_outputs
+        if: always()
+        env:
+          VERSION: ${{ needs.calculate_version.outputs.next_version }}
+          RELEASE_URL: ${{ needs.create_release.outputs.release_url }}
+          DIGEST: ${{ needs.build_and_push.outputs.image_digest }}
+          IMAGE_SIZE: ${{ needs.build_and_push.outputs.image_size_bytes }}
+          DURATION: ${{ needs.build_and_push.outputs.build_duration_seconds }}
+        run: |
+          {
+            printf 'release_version=%s\n' "${VERSION}"
+            printf 'release_url=%s\n' "${RELEASE_URL}"
+            printf 'image_digest=%s\n' "${DIGEST}"
+            printf 'image_size_bytes=%s\n' "${IMAGE_SIZE}"
+            printf 'build_duration_seconds=%s\n' "${DURATION}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Flag failures
+        if: ${{ needs.build_and_push.result == 'failure' || needs.create_release.result == 'failure' || needs.calculate_version.result == 'failure' }}
+        run: |
+          echo "::error::One or more release steps failed. Check logs for details."
+          exit 1
