@@ -13,8 +13,33 @@ else
     export SSL_SERVER_BLOCK=""
 fi
 
+
+
+
+# Check if security config exists
+if [ -f "/etc/nginx/conf.d/security.conf" ]; then
+    echo "Security config found. Inlining into nginx.conf."
+    SECURITY_CONFIG=$(cat /etc/nginx/conf.d/security.conf)
+    export SECURITY_CONFIG
+else
+    echo "Security config not found. Skipping inlined security config."
+    export SECURITY_CONFIG=""
+fi
+
+# Check if API security config exists
+if [ -f "/etc/nginx/conf.d/api-security.conf" ]; then
+    echo "API security config found. Inlining into nginx.conf."
+    API_SECURITY_CONFIG=$(cat /etc/nginx/conf.d/api-security.conf)
+    export API_SECURITY_CONFIG
+else
+    echo "API security config not found. Skipping inlined API security config."
+    export API_SECURITY_CONFIG=""
+fi
+
 # Generate the final nginx configuration using envsubst
-envsubst '${SSL_SERVER_BLOCK}' < /etc/nginx/templates/nginx.conf.template > /etc/nginx/conf.d/default.conf
+envsubst '${SSL_SERVER_BLOCK} ${SECURITY_CONFIG} ${API_SECURITY_CONFIG}' < /etc/nginx/templates/nginx.conf.template > /etc/nginx/conf.d/default.conf
+
+
 
 echo "Generated nginx configuration:"
 echo "================================"
