@@ -17,9 +17,9 @@ fi
 
 
 # Check if security config exists
-if [ -f "/etc/nginx/conf.d/security.conf" ]; then
+if [ -f "/etc/nginx/security.conf" ]; then
     echo "Security config found. Inlining into nginx.conf."
-    SECURITY_CONFIG=$(cat /etc/nginx/conf.d/security.conf)
+    SECURITY_CONFIG=$(cat /etc/nginx/security.conf)
     export SECURITY_CONFIG
 else
     echo "Security config not found. Skipping inlined security config."
@@ -27,9 +27,9 @@ else
 fi
 
 # Check if API security config exists
-if [ -f "/etc/nginx/conf.d/api-security.conf" ]; then
+if [ -f "/etc/nginx/api-security.conf" ]; then
     echo "API security config found. Inlining into nginx.conf."
-    API_SECURITY_CONFIG=$(cat /etc/nginx/conf.d/api-security.conf)
+    API_SECURITY_CONFIG=$(cat /etc/nginx/api-security.conf)
     export API_SECURITY_CONFIG
 else
     echo "API security config not found. Skipping inlined API security config."
